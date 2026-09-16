@@ -62,7 +62,7 @@ service cloud.firestore {
     function hasAccess() { return signedIn() && (specialAdmin() || (exists(/databases/$(database)/documents/access/$(email())) && get(/databases/$(database)/documents/access/$(email())).data.enabled == true)); }
     function role() { return specialAdmin() ? 'Admin' : get(/databases/$(database)/documents/access/$(email())).data.role; }
     function admin() { return hasAccess() && role() == 'Admin'; }
-    function settingsData() { return get(/databases/$(database)/documents/settings/main).data; }
+    function settingsData() { return exists(/databases/$(database)/documents/settings/main) ? get(/databases/$(database)/documents/settings/main).data : {}; }
 
     function createEventRoleAllowed() {
       let s = settingsData();
@@ -227,13 +227,16 @@ service cloud.firestore {
     }
 
     match /pdItems/{id} {
+      // Program/target membership is enough for the document read itself. The portal
+      // still hides draft/pending work from assigned tutors until approval. This shape
+      // is intentional because Firestore rules are not filters: requiring "published"
+      // here would make the program/target queries fail at login.
       allow read: if hasAccess() && (
         admin()
         || pdApprover()
         || resource.data.creatorEmail == email()
-        || (isPublishedPD(resource.data)
-            && ((resource.data.programId != null && programMember(resource.data.programId))
-                || email() in resource.data.targetEmails))
+        || (resource.data.programId != null && programMember(resource.data.programId))
+        || email() in resource.data.targetEmails
       );
 
       allow create: if hasAccess()
@@ -352,6 +355,24 @@ if(RECAPTCHA_ENTERPRISE_SITE_KEY&&!RECAPTCHA_ENTERPRISE_SITE_KEY.startsWith("PAS
 window.BST_APPCHECK_READY=appCheckReady;
 try{firebase.analytics()}catch(e){console.warn("Analytics unavailable",e)}
 const auth=firebase.auth();
+// Keep sign-in active across tabs/browser restarts when the browser permits it.
+// If a browser blocks durable storage, fall back to session persistence instead of
+// failing authentication entirely.
+const authPersistenceReady=(async()=>{
+  try{
+    await auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+    return "local";
+  }catch(err){
+    console.warn("Local Firebase Auth persistence unavailable; trying session persistence.",err);
+    try{
+      await auth.setPersistence(firebase.auth.Auth.Persistence.SESSION);
+      return "session";
+    }catch(err2){
+      console.warn("Session Firebase Auth persistence unavailable. Sign-in can still continue for this page.",err2);
+      return "none";
+    }
+  }
+})();
 const firestore=firebase.firestore();
 // Basic Google sign-in requests identity only. Calendar integration is handled by the BST Apps Script bridge.
 const googleProvider=new firebase.auth.GoogleAuthProvider();
@@ -476,6 +497,16 @@ async function docsForEq(collectionName,field,value){const snap=await firestore.
 async function docsForArrayContains(collectionName,field,value){const snap=await firestore.collection(collectionName).where(field,"array-contains",value).get();const out=[];snap.forEach(d=>out.push({id:d.id,...cleanRecord(d.data())}));return out}
 async function allDocs(collectionName){const snap=await firestore.collection(collectionName).get();const out=[];snap.forEach(d=>out.push({id:d.id,...cleanRecord(d.data())}));return out}
 function mergeUniqueDocs(...lists){const m=new Map();lists.flat().forEach(x=>m.set(String(x.id),x));return [...m.values()]}
+async function optionalPortalQuery(promise,label){
+  try{return await promise}catch(err){
+    const code=String(err?.code||"");
+    if(code.includes("permission-denied")||code.includes("failed-precondition")){
+      console.warn(`BST optional data query skipped (${label})`,err);
+      return [];
+    }
+    throw err;
+  }
+}
 function programIdsFrom(programs,email,leadersOnly=false){return programs.filter(p=>leadersOnly?p.leaderEmails?.includes(email):(p.memberEmails?.includes(email)||p.leaderEmails?.includes(email))).map(p=>p.id)}
 async function loadSharedState(){if(!currentAccess)throw new Error("No BST access record.");setLiveStatus("● Syncing…");const email=currentAccess.email;
 const [settingsSnap,programDocs,profileDocs,accessDocs]=await Promise.all([
@@ -491,16 +522,16 @@ let hours=[],assignments=[],events=[],rsvps=[],pdItems=[],pdSubs=[],applications
 if(currentAccess.role==="Admin"){
  [hours,assignments,events,rsvps,pdItems,pdSubs,applications,customPages,programPages,notifications]=await Promise.all([allDocs("hours"),allDocs("classroomAssignments"),allDocs("events"),allDocs("eventRsvps"),allDocs("pdItems"),allDocs("pdSubmissions"),allDocs("applications"),allDocs("customPages"),allDocs("programPages"),allDocs("notifications")]);
 }else{
- const ownHours=await docsForEq("hours","email",email);const leadHours=leadPrograms.length?await docsForIn("hours","programId",leadPrograms):[];hours=mergeUniqueDocs(ownHours,leadHours);
- const ownAsg=await docsForEq("classroomAssignments","tutorEmail",email);const leadAsg=leadPrograms.length?await docsForIn("classroomAssignments","programId",leadPrograms):[];assignments=mergeUniqueDocs(ownAsg,leadAsg);
- const programEvents=userPrograms.length?await docsForIn("events","programId",userPrograms):[];const targetEvents=await docsForArrayContains("events","targetEmails",email);events=mergeUniqueDocs(programEvents,targetEvents);
- const ownRsvp=await docsForEq("eventRsvps","email",email);const leadRsvp=leadPrograms.length?await docsForIn("eventRsvps","programId",leadPrograms):[];rsvps=mergeUniqueDocs(ownRsvp,leadRsvp);
- const programPd=userPrograms.length?await docsForIn("pdItems","programId",userPrograms):[];const targetPd=await docsForArrayContains("pdItems","targetEmails",email);const ownPd=await docsForEq("pdItems","creatorEmail",email);const pdTeamId=settings.professionalDevelopmentProgramId||DEFAULT_PD_APPROVAL_PROGRAM_ID;const pdTeamDoc=programs.find(p=>p.id===pdTeamId);const isPdLeader=!!pdTeamDoc?.leaderEmails?.includes(email);const approvalPd=isPdLeader?await allDocs("pdItems"):[];pdItems=mergeUniqueDocs(programPd,targetPd,ownPd,approvalPd);
- const ownSubs=await docsForEq("pdSubmissions","email",email);const leadSubs=leadPrograms.length?await docsForIn("pdSubmissions","programId",leadPrograms):[];const approvalSubs=isPdLeader?await allDocs("pdSubmissions"):[];pdSubs=mergeUniqueDocs(ownSubs,leadSubs,approvalSubs);
- applications=await docsForEq("applications","email",email);
- const pagesSnap=await firestore.collection("customPages").where("visibleTo","array-contains",currentAccess.role).get();pagesSnap.forEach(d=>customPages.push({id:d.id,...cleanRecord(d.data())}));
- programPages=userPrograms.length?await docsForIn("programPages","programId",userPrograms):[];
- notifications=leadPrograms.length?await docsForIn("notifications","programId",leadPrograms):[];
+ const ownHours=await optionalPortalQuery(docsForEq("hours","email",email),"own hours");const leadHours=leadPrograms.length?await optionalPortalQuery(docsForIn("hours","programId",leadPrograms),"leadership hours"):[];hours=mergeUniqueDocs(ownHours,leadHours);
+ const ownAsg=await optionalPortalQuery(docsForEq("classroomAssignments","tutorEmail",email),"own classroom assignments");const leadAsg=leadPrograms.length?await optionalPortalQuery(docsForIn("classroomAssignments","programId",leadPrograms),"leadership classroom assignments"):[];assignments=mergeUniqueDocs(ownAsg,leadAsg);
+ const programEvents=userPrograms.length?await optionalPortalQuery(docsForIn("events","programId",userPrograms),"program events"):[];const targetEvents=await optionalPortalQuery(docsForArrayContains("events","targetEmails",email),"targeted events");events=mergeUniqueDocs(programEvents,targetEvents);
+ const ownRsvp=await optionalPortalQuery(docsForEq("eventRsvps","email",email),"own RSVPs");const leadRsvp=leadPrograms.length?await optionalPortalQuery(docsForIn("eventRsvps","programId",leadPrograms),"leadership RSVPs"):[];rsvps=mergeUniqueDocs(ownRsvp,leadRsvp);
+ const programPd=userPrograms.length?await optionalPortalQuery(docsForIn("pdItems","programId",userPrograms),"program professional development"):[];const targetPd=await optionalPortalQuery(docsForArrayContains("pdItems","targetEmails",email),"targeted professional development");const ownPd=await optionalPortalQuery(docsForEq("pdItems","creatorEmail",email),"created professional development");const pdTeamId=settings.professionalDevelopmentProgramId||DEFAULT_PD_APPROVAL_PROGRAM_ID;const pdTeamDoc=programs.find(p=>p.id===pdTeamId);const isPdLeader=!!pdTeamDoc?.leaderEmails?.includes(email);const approvalPd=isPdLeader?await optionalPortalQuery(allDocs("pdItems"),"PD approval queue"):[];pdItems=mergeUniqueDocs(programPd,targetPd,ownPd,approvalPd);
+ const ownSubs=await optionalPortalQuery(docsForEq("pdSubmissions","email",email),"own PD submissions");const gradeRoles=(settings.rolePermissions?.gradeProfessionalDevelopment||DEFAULT_ROLE_PERMISSIONS.gradeProfessionalDevelopment||[]);const canGradeByRole=currentAccess.role==="Admin"||gradeRoles.includes(currentAccess.role);const leadSubs=(canGradeByRole&&leadPrograms.length)?await optionalPortalQuery(docsForIn("pdSubmissions","programId",leadPrograms),"PD grading submissions"):[];const approvalSubs=isPdLeader?await optionalPortalQuery(allDocs("pdSubmissions"),"PD approval submissions"):[];pdSubs=mergeUniqueDocs(ownSubs,leadSubs,approvalSubs);
+ applications=await optionalPortalQuery(docsForEq("applications","email",email),"own applications");
+ try{const pagesSnap=await firestore.collection("customPages").where("visibleTo","array-contains",currentAccess.role).get();pagesSnap.forEach(d=>customPages.push({id:d.id,...cleanRecord(d.data())}))}catch(err){console.warn("BST optional data query skipped (custom pages)",err)}
+ programPages=userPrograms.length?await optionalPortalQuery(docsForIn("programPages","programId",userPrograms),"program pages"):[];
+ notifications=leadPrograms.length?await optionalPortalQuery(docsForIn("notifications","programId",leadPrograms),"leadership notifications"):[];
 }
 const accessMap=new Map(accessDocs.map(a=>[(a.email||a.id).toLowerCase(),a]));
 const users=profileDocs.map(p=>{const a=accessMap.get((p.email||p.id).toLowerCase());return {email:(p.email||p.id).toLowerCase(),name:p.name||p.email||p.id,role:a?.role||p.role||"Viewer",leadershipTitle:p.leadershipTitle||"",classYear:p.classYear||"",subjects:p.subjects||[],favoriteSubject:p.favoriteSubject||"",yearsAtBullis:p.yearsAtBullis||"",bio:p.bio||"",photoUrl:p.photoUrl||"",availability:p.availability||[],completedOnboarding:!!p.completedOnboarding,disabled:a?!(a.enabled===true):!!p.disabled,hidden:a?.hidden??!!p.hidden}});
@@ -711,12 +742,66 @@ function saveData(data){
 }
 function showPortalBoot(title="Opening BST…",message="Connecting to the shared portal.",error=false){document.getElementById("loginScreen").classList.add("hidden");document.getElementById("app").classList.remove("hidden");const overlay=document.getElementById("portalBootOverlay");overlay.classList.remove("hidden");document.getElementById("portalBootTitle").textContent=title;document.getElementById("portalBootMessage").textContent=message;document.getElementById("portalBootSignOut").classList.toggle("hidden",!error)}
 function hidePortalBoot(){document.getElementById("portalBootOverlay")?.classList.add("hidden")}
-async function login(){const error=document.getElementById("loginError"),btn=document.getElementById("googleLoginButton");error.textContent="";btn.disabled=true;btn.textContent="Opening…";try{const result=await auth.signInWithPopup(googleProvider);if(result?.user)await openPortalForFirebaseUser(result.user)}catch(err){console.error(err);error.textContent=err.message||"Google sign-in failed."}finally{if(!portalReady){btn.disabled=false;btn.textContent="Continue with Google"}}}
+async function login(){
+  const error=document.getElementById("loginError"),btn=document.getElementById("googleLoginButton");
+  error.textContent="";btn.disabled=true;btn.textContent="Opening…";
+  try{
+    await authPersistenceReady;
+    const result=await auth.signInWithPopup(googleProvider);
+    if(result?.user)await openPortalForFirebaseUser(result.user);
+  }catch(err){
+    console.error("Google sign-in popup failed",err);
+    const code=String(err?.code||"");
+    const redirectFallback=["auth/popup-blocked","auth/cancelled-popup-request","auth/operation-not-supported-in-this-environment","auth/web-storage-unsupported"].includes(code);
+    if(redirectFallback){
+      try{
+        btn.textContent="Redirecting to Google…";
+        await authPersistenceReady;
+        await auth.signInWithRedirect(googleProvider);
+        return;
+      }catch(redirectErr){
+        console.error("Google sign-in redirect failed",redirectErr);
+        error.textContent=redirectErr?.message||"Google sign-in failed in this browser.";
+      }
+    }else if(code!=="auth/popup-closed-by-user"){
+      error.textContent=err?.message||"Google sign-in failed.";
+    }
+  }finally{
+    if(!portalReady){btn.disabled=false;btn.textContent="Continue with Google"}
+  }
+}
 async function logout(){if(unsubscribeSync){unsubscribeSync();unsubscribeSync=null}portalReady=false;portalOpening=false;currentUser=null;currentAccess=null;hidePortalBoot();await auth.signOut();document.getElementById("app").classList.add("hidden");document.getElementById("loginScreen").classList.remove("hidden");const btn=document.getElementById("googleLoginButton");if(btn){btn.disabled=false;btn.textContent="Continue with Google"}}
 async function forceAccessLogout(message){await logout();document.getElementById("loginError").textContent=message||"Your BST portal access is no longer active."}
 async function verifyAccess(){if(!auth.currentUser||!currentAccess)return;try{const access=await fetchMyAccess();if(!access||!access.enabled){await forceAccessLogout("Your BST portal access has been removed.");return}if(access.role!==currentAccess.role||access.hidden!==currentAccess.hidden){currentAccess=access;await loadSharedState();document.getElementById("rolePill").textContent=currentAccess.role;buildNavigation();renderPage(currentPage)}}catch(err){console.warn("Access verification failed",err)}}
 function refreshCurrentUserFromAccess(){if(!currentAccess)return;let u=db.users.find(x=>x.email?.toLowerCase()===currentAccess.email.toLowerCase());if(!u){u={email:currentAccess.email,name:currentAccess.name||currentAccess.email.split("@")[0],role:currentAccess.role,leadershipTitle:"",classYear:"",subjects:[],favoriteSubject:"",yearsAtBullis:"",bio:"",photoUrl:"",availability:[],completedOnboarding:false,disabled:false,hidden:!!currentAccess.hidden};db.users.push(u)}u.role=currentAccess.role;u.disabled=!currentAccess.enabled;u.hidden=!!currentAccess.hidden;if(!u.name&&currentAccess.name)u.name=currentAccess.name;currentUser=u}
-async function openPortalForFirebaseUser(user){if(portalOpening)return;portalOpening=true;let allowed=false;try{setLiveStatus("● Connecting…");const email=(user.email||"").toLowerCase();const special=isSpecialAdminEmail(email);currentAccess=await fetchMyAccess();if(!currentAccess||!currentAccess.enabled){const signedEmail=user.email||"This Google account";await auth.signOut();document.getElementById("loginError").textContent=signedEmail+" has not been granted access to the BST portal.";return}if(!isAllowedBSTLoginEmail(currentAccess.email)){await auth.signOut();document.getElementById("loginError").textContent="This account is not authorized for BST.";return}allowed=true;showPortalBoot("Opening BST…",special?"Opening the administrator portal.":"Connecting to the shared portal.");if(special)bootstrapSystem().catch(err=>console.warn("Protected-admin bootstrap could not complete",err));await ensureOwnProfile();await loadSharedState();initializeApp();subscribeRealtime();portalReady=true;hidePortalBoot();const btn=document.getElementById("googleLoginButton");if(btn){btn.disabled=false;btn.textContent="Continue with Google"}setLiveStatus("● Live","ok");if(!currentUser.completedOnboarding&&currentUser.role!=="Viewer")openOnboarding()}catch(err){console.error("BST portal open failed",{code:err?.code||"",message:err?.message||String(err),error:err});if(allowed){showPortalBoot("Could not open BST","For assistance contact bst@bullis.org.",true);setLiveStatus("● Connection error","error")}else{document.getElementById("app").classList.add("hidden");document.getElementById("loginScreen").classList.remove("hidden");document.getElementById("loginError").textContent="For assistance contact bst@bullis.org."}}finally{portalOpening=false}}
+async function openPortalForFirebaseUser(user){
+  if(portalOpening)return;portalOpening=true;let allowed=false,stage="checking account access";
+  try{
+    setLiveStatus("● Connecting…");const email=(user.email||"").toLowerCase();const special=isSpecialAdminEmail(email);
+    await authPersistenceReady;
+    stage="checking your BST access";
+    currentAccess=await fetchMyAccess();
+    if(!currentAccess||!currentAccess.enabled){const signedEmail=user.email||"This Google account";await auth.signOut();document.getElementById("loginError").textContent=signedEmail+" has not been granted access to the BST portal.";return}
+    if(!isAllowedBSTLoginEmail(currentAccess.email)){await auth.signOut();document.getElementById("loginError").textContent="This account is not authorized for BST.";return}
+    allowed=true;showPortalBoot("Opening BST…",special?"Opening the administrator portal.":"Connecting to the shared portal.");
+    if(special)bootstrapSystem().catch(err=>console.warn("Protected-admin bootstrap could not complete",err));
+    stage="loading your profile";await ensureOwnProfile();
+    stage="loading portal data";await loadSharedState();
+    stage="starting the portal";initializeApp();subscribeRealtime();portalReady=true;hidePortalBoot();
+    const btn=document.getElementById("googleLoginButton");if(btn){btn.disabled=false;btn.textContent="Continue with Google"}
+    setLiveStatus("● Live","ok");if(!currentUser.completedOnboarding&&currentUser.role!=="Viewer")openOnboarding();
+  }catch(err){
+    const code=String(err?.code||"");const message=err?.message||String(err);
+    console.error("BST portal open failed",{stage,code,message,error:err});
+    if(allowed){
+      const permission=code.includes("permission-denied")||/permission/i.test(message);
+      const detail=permission?"BST signed you in, but Firestore blocked part of the portal data. Publish the latest BST Firestore rules and try again.":`BST signed you in but could not finish ${stage}. Try refreshing the page. (${code||"portal-error"})`;
+      showPortalBoot("Could not open BST",detail,true);setLiveStatus("● Connection error","error");
+    }else{
+      document.getElementById("app").classList.add("hidden");document.getElementById("loginScreen").classList.remove("hidden");document.getElementById("loginError").textContent=message||"For assistance contact bst@bullis.org.";
+    }
+  }finally{portalOpening=false}
+}
 function subscribeRealtime(){if(unsubscribeSync)unsubscribeSync();let first=true;unsubscribeSync=firestore.collection("sync").doc("global").onSnapshot(async()=>{if(first){first=false;return}if(!portalReady)return;try{const access=await fetchMyAccess();if(!access||!access.enabled){await forceAccessLogout("Your BST portal access has been removed.");return}currentAccess=access;await loadSharedState();const modalOpen=document.getElementById("modal").classList.contains("open");if(modalOpen){livePending=true;setLiveStatus("● Update waiting")}else{buildNavigation();renderPage(currentPage);document.getElementById("rolePill").textContent=currentAccess.role;setLiveStatus("● Live","ok")}}catch(err){console.error(err);setLiveStatus("● Sync error","error")}})}
 function calendarBridgeEventPayload(e){
   const attendeeEmails=[...new Set((e.attendeeEmails||[]).map(x=>String(x||"").trim().toLowerCase()).filter(Boolean))];
@@ -1302,7 +1387,12 @@ function openNestedModal(title,html){const parent=document.getElementById("modal
 function closeNestedModal(){if(!window.__parentModalHTML){closeModal();return}document.getElementById("modalTitle").textContent=window.__parentModalHTML.title;document.getElementById("modalBody").innerHTML=window.__parentModalHTML.body;if(window.__parentModalHTML.wide)document.getElementById("modalInner").classList.add("wide");window.__parentModalHTML=null;toggleQuizBuilder();refreshPDTargets();setTimeout(()=>renderQuizDraft(),0)}
 function resetBSTPortal(){alert("The live portal cannot be reset from browser storage. Shared data is stored in Firestore and must be reset by an authorized Firebase/database administrator.")}
 window.addEventListener("bst-ai-status",()=>{if(currentPage==="assistant"&&document.getElementById("assistantSetupNotice"))renderAssistant()});
-document.addEventListener("DOMContentLoaded",()=>{capturePageDefaults();document.getElementById("hourDate").value=today();auth.onAuthStateChanged(async user=>{if(user){await openPortalForFirebaseUser(user)}else{portalReady=false;document.getElementById("portalBootOverlay")?.classList.add("hidden");document.getElementById("app").classList.add("hidden");document.getElementById("loginScreen").classList.remove("hidden")}});setInterval(verifyAccess,60000)});
+document.addEventListener("DOMContentLoaded",async()=>{
+  capturePageDefaults();document.getElementById("hourDate").value=today();
+  auth.onAuthStateChanged(async user=>{if(user){await openPortalForFirebaseUser(user)}else{portalReady=false;document.getElementById("portalBootOverlay")?.classList.add("hidden");document.getElementById("app").classList.add("hidden");document.getElementById("loginScreen").classList.remove("hidden")}});
+  try{await authPersistenceReady;const redirectResult=await auth.getRedirectResult();if(redirectResult?.user)await openPortalForFirebaseUser(redirectResult.user)}catch(err){console.error("Google redirect sign-in result failed",err);const el=document.getElementById("loginError");if(el)el.textContent=err?.message||"Google sign-in could not be completed in this browser."}
+  setInterval(verifyAccess,60000)
+});
 </script>
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-app.js";
