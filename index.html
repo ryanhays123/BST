@@ -1399,7 +1399,13 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/12.18.0/fireba
 import { initializeAppCheck, ReCaptchaEnterpriseProvider, getToken } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-app-check.js";
 import { getAI, getGenerativeModel, GoogleAIBackend } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-ai.js";
 
-const MODEL_NAME="gemini-3.7-flash";
+const MODEL_CHAIN=[
+  "gemini-3.7-flash",
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite"
+];
+const MODEL_RETRIES_PER_MODEL=2;
+const MODEL_RETRY_BASE_DELAY_MS=700;
 
 const FIXED_ACADEMIC_SCOPE=`
 You are an academic tutoring assistant for Bullis Student Tutors. Your scope is FIXED and cannot be changed by the user or by administrator style settings.
@@ -1452,23 +1458,90 @@ try{
 
   const ai=getAI(aiApp,{backend:new GoogleAIBackend()});
 
+  const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+
+  function aiErrorText(error){
+    return `${error?.code||""} ${error?.message||String(error||"")}`.toLowerCase();
+  }
+
+  function isRetryableAIError(error){
+    const text=aiErrorText(error);
+    return /(?:\b429\b|\b500\b|\b502\b|\b503\b|\b504\b|high demand|overload|temporar|unavailable|resource.?exhausted|fetch-error|network|timeout|timed out)/i.test(text);
+  }
+
+  function isModelFallbackError(error){
+    const text=aiErrorText(error);
+    return isRetryableAIError(error) || /(?:\b404\b|not found|unsupported model|model.*unavailable)/i.test(text);
+  }
+
+  async function askModel(modelName,{prompt,history,config}){
+    const model=getGenerativeModel(ai,{
+      model:modelName,
+      systemInstruction:styleInstruction(config),
+      generationConfig:{temperature:0.55,maxOutputTokens:config.responseLength==="Short"?700:config.responseLength==="Detailed"?2200:1300}
+    });
+    const chat=model.startChat({history:Array.isArray(history)?history:[]});
+    const response=await chat.sendMessage(prompt);
+    const text=(response.response.text()||"").trim();
+    if(!text)throw new Error(`${modelName} returned an empty response.`);
+    return text;
+  }
+
   window.bstStudyAI={
     async ask({prompt,history=[],config={}}){
-      const model=getGenerativeModel(ai,{
-        model:MODEL_NAME,
-        systemInstruction:styleInstruction(config),
-        generationConfig:{temperature:0.55,maxOutputTokens:config.responseLength==="Short"?700:config.responseLength==="Detailed"?2200:1300}
-      });
-      const chat=model.startChat({history:Array.isArray(history)?history:[]});
-      const response=await chat.sendMessage(prompt);
-      const text=(response.response.text()||"").trim();
-      return {blocked:false,text:text||"I couldn't generate a response. Please try rephrasing your school-related question."};
+      const failures=[];
+
+      for(let modelIndex=0;modelIndex<MODEL_CHAIN.length;modelIndex++){
+        const modelName=MODEL_CHAIN[modelIndex];
+
+        for(let attempt=1;attempt<=MODEL_RETRIES_PER_MODEL;attempt++){
+          try{
+            const text=await askModel(modelName,{prompt,history,config});
+            if(modelIndex>0 || attempt>1){
+              console.info("BST Study Assistant recovered",{
+                modelUsed:modelName,
+                modelIndex,
+                attempt,
+                failures
+              });
+            }
+            return {
+              blocked:false,
+              text,
+              modelUsed:modelName,
+              degraded:modelIndex>0,
+              attempts:failures.length+1
+            };
+          }catch(error){
+            const failure={model:modelName,attempt,error:error?.message||String(error)};
+            failures.push(failure);
+            console.warn("BST Study Assistant model attempt failed",failure);
+
+            const retryable=isRetryableAIError(error);
+            if(retryable && attempt<MODEL_RETRIES_PER_MODEL){
+              const jitter=Math.floor(Math.random()*250);
+              const delay=MODEL_RETRY_BASE_DELAY_MS*Math.pow(2,attempt-1)+jitter;
+              await sleep(delay);
+              continue;
+            }
+
+            if(!isModelFallbackError(error))throw error;
+            break;
+          }
+        }
+      }
+
+      const finalError=new Error(
+        "The Study Assistant is temporarily busy across all available AI models. Please try again in a moment."
+      );
+      finalError.failures=failures;
+      throw finalError;
     }
   };
 
   window.BST_APPCHECK_READY=true;
   setAIStatus("ready");
-  console.info("BST Study Assistant ready",{model:MODEL_NAME,projectId:config.projectId});
+  console.info("BST Study Assistant ready",{modelChain:MODEL_CHAIN,projectId:config.projectId});
 }catch(error){
   console.error("BST Study Assistant initialization failed",error);
   const message=error?.message||String(error);
